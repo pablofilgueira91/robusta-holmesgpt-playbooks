@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robusta-holmesgpt-playbooks"
+version = "0.1.0"
+description = "Custom Robusta playbooks for HolmesGPT integration"
+authors = [{name = "Pablo Filgueira"}]
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
