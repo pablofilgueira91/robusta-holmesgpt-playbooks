@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="robusta-holmesgpt-playbooks",
+    name="holmesgpt_playbooks",
     version="0.1.0",
     packages=find_packages(),
     install_requires=[
