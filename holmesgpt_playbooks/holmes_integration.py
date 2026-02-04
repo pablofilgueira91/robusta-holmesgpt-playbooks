@@ -126,14 +126,21 @@ Logs del Pod (últimas líneas):
     holmesgpt_url = "http://holmesgpt-holmes.holmesgpt.svc.cluster.local:80"
     
     try:
-        # Preparar payload para HolmesGPT
-        # HolmesGPT espera un formato específico de solicitud
+        # Preparar payload para HolmesGPT API
         payload = {
-            "context": context,
-            "resource_type": "pod",
-            "resource_name": pod_name,
-            "namespace": namespace,
-            "ask": f"Analiza el siguiente problema de pod en Kubernetes y proporciona una causa raíz y solución recomendada."
+            "source": "robusta",
+            "title": f"Pod Issue: {pod_name}",
+            "description": f"Analiza el siguiente problema de pod en Kubernetes y proporciona una causa raíz y solución recomendada.",
+            "subject": {
+                "name": pod_name,
+                "namespace": namespace,
+                "kind": "Pod"
+            },
+            "context": {
+                "pod_status": pod_status,
+                "events": events_text,
+                "logs": pod_logs[-2000:] if len(pod_logs) > 2000 else pod_logs
+            }
         }
         
         logger.info(f"Enviando solicitud a HolmesGPT: {holmesgpt_url}")
@@ -258,11 +265,23 @@ Considera:
     
     try:
         payload = {
-            "context": context,
-            "resource_type": "pod",
-            "resource_name": pod.metadata.name,
-            "namespace": pod.metadata.namespace,
-            "ask": "Analiza este problema de ImagePullBackOff y proporciona la causa raíz y solución."
+            "source": "robusta",
+            "title": f"ImagePullBackOff: {pod.metadata.name}",
+            "description": "Analiza este problema de ImagePullBackOff y proporciona la causa raíz y solución.",
+            "subject": {
+                "name": pod.metadata.name,
+                "namespace": pod.metadata.namespace,
+                "kind": "Pod"
+            },
+            "context": {
+                "container_statuses": container_statuses,
+                "analysis_points": [
+                    "Si la imagen existe en el registro",
+                    "Si las credenciales son correctas",
+                    "Si el nombre de la imagen está bien escrito",
+                    "Si hay problemas de red o permisos"
+                ]
+            }
         }
         
         response = requests.post(
