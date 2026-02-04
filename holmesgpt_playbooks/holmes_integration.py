@@ -179,8 +179,11 @@ Logs del Pod (últimas líneas):
         finding_type=FindingType.ISSUE,
     )
     
+    # Construir bloques de enriquecimiento
+    enrichment_blocks = []
+    
     # Agregar resumen del problema
-    finding.add_markdown_block(
+    enrichment_blocks.append(
         MarkdownBlock(
             f"**Pod problemático:** `{namespace}/{pod_name}`\n"
             f"**Fase:** {pod.status.phase}\n"
@@ -189,7 +192,7 @@ Logs del Pod (últimas líneas):
     )
     
     # Agregar análisis de HolmesGPT
-    finding.add_markdown_block(
+    enrichment_blocks.append(
         MarkdownBlock(
             f"## 🤖 Análisis de HolmesGPT\n\n{analysis_text}"
         )
@@ -201,22 +204,25 @@ Logs del Pod (últimas líneas):
             [e.type, e.reason, e.message[:100]]
             for e in pod_events[:5]  # Últimos 5 eventos
         ]
-        finding.add_enrichment([
+        enrichment_blocks.append(
             TableBlock(
                 rows=events_data,
                 headers=["Tipo", "Razón", "Mensaje"],
                 table_name="Eventos Recientes del Pod"
             )
-        ])
+        )
     
     # Agregar logs como archivo adjunto (opcional)
     if pod_logs and len(pod_logs) > 100:
-        finding.add_enrichment([
+        enrichment_blocks.append(
             FileBlock(
                 filename=f"{pod_name}_logs.txt",
                 contents=pod_logs.encode()
             )
-        ])
+        )
+    
+    # Agregar todos los bloques al finding
+    finding.add_enrichment(enrichment_blocks)
     
     event.add_finding(finding)
 
@@ -312,8 +318,11 @@ Considera:
         finding_type=FindingType.ISSUE,
     )
     
+    # Construir bloques de enriquecimiento
+    enrichment_blocks = []
+    
     # Información del problema
-    finding.add_markdown_block(
+    enrichment_blocks.append(
         MarkdownBlock(
             f"**🚨 Problema:** ImagePullBackOff\n"
             f"**📦 Pod:** `{pod.metadata.namespace}/{pod.metadata.name}`\n"
@@ -323,7 +332,7 @@ Considera:
     )
     
     # Análisis de HolmesGPT
-    finding.add_markdown_block(
+    enrichment_blocks.append(
         MarkdownBlock(
             f"## 🤖 Diagnóstico de HolmesGPT\n\n{analysis_text}"
         )
@@ -335,12 +344,15 @@ Considera:
             [cs['name'], cs['image'], cs['reason'], cs['message'][:50]]
             for cs in container_statuses
         ]
-        finding.add_enrichment([
+        enrichment_blocks.append(
             TableBlock(
                 rows=container_data,
                 headers=["Contenedor", "Imagen", "Razón", "Mensaje"],
-                table_name="Contenedores Afectados"
+                table_name="Detalles de Contenedores"
             )
-        ])
+        )
+    
+    # Agregar todos los bloques al finding
+    finding.add_enrichment(enrichment_blocks)
     
     event.add_finding(finding)
