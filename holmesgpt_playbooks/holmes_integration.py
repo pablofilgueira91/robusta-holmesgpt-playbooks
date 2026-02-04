@@ -139,7 +139,7 @@ Logs del Pod (últimas líneas):
         logger.info(f"Enviando solicitud a HolmesGPT: {holmesgpt_url}")
         
         response = requests.post(
-            f"{holmesgpt_url}/api/ask",
+            f"{holmesgpt_url}/api/investigate",
             json=payload,
             timeout=60,
             headers={"Content-Type": "application/json"}
@@ -266,7 +266,7 @@ Considera:
         }
         
         response = requests.post(
-            f"{holmesgpt_url}/api/ask",
+            f"{holmesgpt_url}/api/investigate",
             json=payload,
             timeout=60,
             headers={"Content-Type": "application/json"}
