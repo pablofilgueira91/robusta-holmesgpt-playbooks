@@ -19,25 +19,6 @@ logger = logging.getLogger(__name__)
 HOLMESGPT_URL = "http://holmesgpt-holmes.holmesgpt.svc.cluster.local:80"
 
 
-def _detectar_problema(pod: Pod) -> str:
-    """Detecta el tipo de problema del pod"""
-    if not pod.status.containerStatuses:
-        return "Unknown"
-    
-    for cs in pod.status.containerStatuses:
-        if cs.state and cs.state.waiting:
-            reason = cs.state.waiting.reason
-            if "ImagePullBackOff" in reason or "ErrImagePull" in reason:
-                return "ImagePullBackOff"
-            elif "CrashLoopBackOff" in reason:
-                return "CrashLoopBackOff"
-        elif cs.state and cs.state.terminated:
-            if cs.state.terminated.reason == "OOMKilled":
-                return "OOMKilled"
-    
-    return pod.status.phase or "Unknown"
-
-
 def _obtener_contexto_pod(event: PodEvent, pod: Pod) -> dict:
     """Recolecta contexto del pod para HolmesGPT"""
     # Eventos del pod
@@ -96,7 +77,7 @@ def _obtener_contexto_pod(event: PodEvent, pod: Pod) -> dict:
 def analizar_pod_con_holmesgpt(event: PodEvent):
     """
     Analiza cualquier problema de pod usando HolmesGPT AI.
-    Detecta automáticamente el tipo de problema y solicita diagnóstico en español.
+    Solicita diagnóstico en español con causa raíz y solución.
     """
     pod: Pod = event.get_pod()
     if not pod:
@@ -104,9 +85,19 @@ def analizar_pod_con_holmesgpt(event: PodEvent):
     
     namespace = pod.metadata.namespace
     pod_name = pod.metadata.name
-    problema = _detectar_problema(pod)
     
-    logger.info(f"Analizando {problema} en {namespace}/{pod_name} con HolmesGPT")
+    # Obtener descripción del problema del estado del pod
+    problema_desc = pod.status.phase or "Error"
+    if pod.status.containerStatuses:
+        for cs in pod.status.containerStatuses:
+            if cs.state and cs.state.waiting and cs.state.waiting.reason:
+                problema_desc = cs.state.waiting.reason
+                break
+            elif cs.state and cs.state.terminated and cs.state.terminated.reason:
+                problema_desc = cs.state.terminated.reason
+                break
+    
+    logger.info(f"Analizando pod {namespace}/{pod_name} ({problema_desc}) con HolmesGPT")
     
     # Recolectar contexto
     contexto = _obtener_contexto_pod(event, pod)
@@ -115,7 +106,7 @@ def analizar_pod_con_holmesgpt(event: PodEvent):
     try:
         payload = {
             "source": "robusta",
-            "title": f"{problema}: {namespace}/{pod_name}",
+            "title": f"{problema_desc}: {namespace}/{pod_name}",
             "description": f"Analiza este problema de Kubernetes y proporciona causa raíz y solución. IMPORTANTE: Responde en español de forma concisa (máximo 300 palabras).",
             "subject": {
                 "name": pod_name,
@@ -142,7 +133,7 @@ def analizar_pod_con_holmesgpt(event: PodEvent):
     
     # Crear Finding conciso
     finding = Finding(
-        title=f"🤖 {problema}: {namespace}/{pod_name}",
+        title=f"🤖 {problema_desc}: {namespace}/{pod_name}",
         aggregation_key=f"HolmesGPT_{namespace}_{pod_name}",
         severity=FindingSeverity.HIGH,
         source=event.get_source(),
