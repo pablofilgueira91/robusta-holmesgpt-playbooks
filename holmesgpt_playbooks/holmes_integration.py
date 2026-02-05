@@ -18,6 +18,37 @@ logger = logging.getLogger(__name__)
 HOLMESGPT_URL = "http://holmesgpt-holmes.holmesgpt.svc.cluster.local:80"
 
 
+def _limpiar_formato_slack(texto: str) -> str:
+    """Limpia el análisis de HolmesGPT para mejor visualización en Slack"""
+    import re
+    
+    # Remover secciones de External Links
+    texto = re.sub(r'# External [Ll]inks.*$', '', texto, flags=re.DOTALL)
+    texto = re.sub(r'## External [Ll]inks.*$', '', texto, flags=re.DOTALL)
+    
+    # Remover links markdown pero conservar el texto
+    texto = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', texto)
+    
+    # Convertir headers markdown a formato Slack más legible
+    texto = re.sub(r'^# (.+)$', r'*\1*', texto, flags=re.MULTILINE)
+    texto = re.sub(r'^## (.+)$', r'*\1*', texto, flags=re.MULTILINE)
+    texto = re.sub(r'^### (.+)$', r'*\1*', texto, flags=re.MULTILINE)
+    
+    # Remover bloques de código bash/shell para acortar
+    texto = re.sub(r'```bash.*?```', '', texto, flags=re.DOTALL)
+    texto = re.sub(r'```shell.*?```', '', texto, flags=re.DOTALL)
+    texto = re.sub(r'```.*?```', '', texto, flags=re.DOTALL)
+    
+    # Limpiar líneas vacías múltiples
+    texto = re.sub(r'\n{3,}', '\n\n', texto)
+    
+    # Limitar longitud si sigue siendo muy largo
+    if len(texto) > 1000:
+        texto = texto[:1000] + "..."
+    
+    return texto.strip()
+
+
 def _obtener_contexto_recurso(event: ExecutionBaseEvent) -> dict:
     """Recolecta contexto del recurso de Kubernetes para HolmesGPT"""
     contexto = {
@@ -154,7 +185,7 @@ def analyze_with_holmesgpt(event: ExecutionBaseEvent):
         payload = {
             "source": "robusta",
             "title": f"Problema en {resource_info}",
-            "description": f"Analiza este problema de Kubernetes y proporciona causa raíz y solución. IMPORTANTE: Responde en español de forma concisa (máximo 300 palabras).",
+            "description": f"Analiza este problema de Kubernetes. IMPORTANTE: Responde en español de forma MUY concisa (máximo 150 palabras). Incluye SOLO: 1) Causa raíz 2) Solución específica. NO incluyas external links ni secciones largas.",
             "subject": {
                 "name": resource_name,
                 "namespace": namespace or "cluster-scoped",
@@ -172,12 +203,14 @@ def analyze_with_holmesgpt(event: ExecutionBaseEvent):
         
         response.raise_for_status()
         resultado = response.json()
-        analisis = resultado.get("analysis", str(resultado))
+        analisis_raw = resultado.get("analysis", str(resultado))
+        
+        # Limpiar formato para Slack
+        analisis = _limpiar_formato_slack(analisis_raw)
         
         # Extraer información de costos si está disponible
         metadata = resultado.get("metadata", {})
         usage = metadata.get("usage", {})
-        tokens_info = ""
         
         if usage:
             prompt_tokens = usage.get("prompt_tokens", 0)
@@ -185,14 +218,11 @@ def analyze_with_holmesgpt(event: ExecutionBaseEvent):
             total_tokens = usage.get("total_tokens", 0)
             
             # Estimación de costo (aproximado para GPT-4, ajustar según modelo)
-            # Ejemplo: GPT-4 ~$0.03/1K prompt tokens, ~$0.06/1K completion tokens
             costo_prompt = (prompt_tokens / 1000) * 0.03
             costo_completion = (completion_tokens / 1000) * 0.06
             costo_total = costo_prompt + costo_completion
             
-            tokens_info = f"\n\n---\n📊 **Uso de recursos:** {total_tokens:,} tokens (~${costo_total:.4f} USD)"
-        
-        analisis = analisis + tokens_info
+            analisis += f"\n\n💰 *{total_tokens:,} tokens • ~${costo_total:.4f} USD*"
         
     except Exception as e:
         logger.error(f"Error comunicándose con HolmesGPT: {e}")
@@ -207,9 +237,9 @@ def analyze_with_holmesgpt(event: ExecutionBaseEvent):
         finding_type=FindingType.ISSUE,
     )
     
-    # Agregar solo el análisis de HolmesGPT
+    # Agregar solo el análisis de HolmesGPT limpio y formateado
     finding.add_enrichment([
-        MarkdownBlock(f"### 🔍 Diagnóstico HolmesGPT\n\n{analisis}")
+        MarkdownBlock(f"🔍 *Diagnóstico HolmesGPT*\n\n{analisis}")
     ])
     
     event.add_finding(finding)
