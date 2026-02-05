@@ -1,11 +1,9 @@
 """
-Custom Robusta playbook for HolmesGPT integration
-This playbook sends pod issues to HolmesGPT for root cause analysis
+Playbook Robusta para integración con HolmesGPT
+Envía problemas de pods a HolmesGPT para análisis de causa raíz con IA
 """
-import json
 import logging
 import requests
-from typing import Dict, Any
 from hikaru.model.rel_1_26 import Pod
 from robusta.api import (
     action,
@@ -14,345 +12,151 @@ from robusta.api import (
     FindingType,
     FindingSeverity,
     MarkdownBlock,
-    TableBlock,
-    FileBlock,
 )
 
 logger = logging.getLogger(__name__)
 
+HOLMESGPT_URL = "http://holmesgpt-holmes.holmesgpt.svc.cluster.local:80"
+
+
+def _detectar_problema(pod: Pod) -> str:
+    """Detecta el tipo de problema del pod"""
+    if not pod.status.containerStatuses:
+        return "Unknown"
+    
+    for cs in pod.status.containerStatuses:
+        if cs.state and cs.state.waiting:
+            reason = cs.state.waiting.reason
+            if "ImagePullBackOff" in reason or "ErrImagePull" in reason:
+                return "ImagePullBackOff"
+            elif "CrashLoopBackOff" in reason:
+                return "CrashLoopBackOff"
+        elif cs.state and cs.state.terminated:
+            if cs.state.terminated.reason == "OOMKilled":
+                return "OOMKilled"
+    
+    return pod.status.phase or "Unknown"
+
+
+def _obtener_contexto_pod(event: PodEvent, pod: Pod) -> dict:
+    """Recolecta contexto del pod para HolmesGPT"""
+    # Eventos del pod
+    try:
+        pod_events = event.list_pod_events()
+        eventos = [{"tipo": e.type, "razon": e.reason, "mensaje": e.message} for e in pod_events[:5]]
+    except:
+        eventos = []
+    
+    # Logs del pod (últimas 1000 caracteres)
+    try:
+        logs = event.get_pod_logs()
+        logs = logs[-1000:] if len(logs) > 1000 else logs
+    except:
+        logs = ""
+    
+    # Estado de contenedores
+    contenedores = []
+    if pod.status.containerStatuses:
+        for cs in pod.status.containerStatuses:
+            info = {
+                "nombre": cs.name,
+                "imagen": cs.image,
+                "ready": cs.ready,
+                "reintentos": cs.restartCount
+            }
+            
+            if cs.state:
+                if cs.state.waiting:
+                    info["estado"] = {
+                        "esperando": {
+                            "razon": cs.state.waiting.reason,
+                            "mensaje": cs.state.waiting.message or ""
+                        }
+                    }
+                elif cs.state.terminated:
+                    info["estado"] = {
+                        "terminado": {
+                            "razon": cs.state.terminated.reason,
+                            "codigo_salida": cs.state.terminated.exitCode,
+                            "mensaje": cs.state.terminated.message or ""
+                        }
+                    }
+            
+            contenedores.append(info)
+    
+    return {
+        "eventos": eventos,
+        "logs": logs,
+        "contenedores": contenedores,
+        "fase": pod.status.phase
+    }
+
 
 @action
-def analyze_with_holmesgpt(event: PodEvent):
+def analizar_pod_con_holmesgpt(event: PodEvent):
     """
-    Envía información del pod problemático a HolmesGPT para análisis de causa raíz
-    
-    Args:
-        event: Evento de Robusta que contiene información del pod
+    Analiza cualquier problema de pod usando HolmesGPT AI.
+    Detecta automáticamente el tipo de problema y solicita diagnóstico en español.
     """
     pod: Pod = event.get_pod()
     if not pod:
-        logger.error("No se pudo obtener información del pod")
         return
-
-    # Recolectar contexto del pod
-    pod_name = pod.metadata.name
+    
     namespace = pod.metadata.namespace
+    pod_name = pod.metadata.name
+    problema = _detectar_problema(pod)
     
-    logger.info(f"Analizando pod {namespace}/{pod_name} con HolmesGPT")
+    logger.info(f"Analizando {problema} en {namespace}/{pod_name} con HolmesGPT")
     
-    # Obtener logs del pod
-    try:
-        pod_logs = event.get_pod_logs()
-    except Exception as e:
-        logger.warning(f"No se pudieron obtener logs del pod: {e}")
-        pod_logs = "No hay logs disponibles"
-    
-    # Obtener eventos del pod
-    try:
-        pod_events = event.list_pod_events()
-        events_text = "\n".join([
-            f"[{e.type}] {e.reason}: {e.message}"
-            for e in pod_events
-        ])
-    except Exception as e:
-        logger.warning(f"No se pudieron obtener eventos del pod: {e}")
-        events_text = "No hay eventos disponibles"
-    
-    # Obtener estado del pod
-    pod_status = {
-        "phase": pod.status.phase,
-        "conditions": [
-            {
-                "type": c.type,
-                "status": c.status,
-                "reason": c.reason if c.reason else "",
-                "message": c.message if c.message else ""
-            }
-            for c in (pod.status.conditions or [])
-        ],
-        "containerStatuses": []
-    }
-    
-    # Información de contenedores
-    if pod.status.containerStatuses:
-        for container_status in pod.status.containerStatuses:
-            status_info = {
-                "name": container_status.name,
-                "ready": container_status.ready,
-                "restartCount": container_status.restartCount,
-                "image": container_status.image,
-            }
-            
-            # Estado del contenedor
-            if container_status.state:
-                if container_status.state.waiting:
-                    status_info["state"] = {
-                        "waiting": {
-                            "reason": container_status.state.waiting.reason,
-                            "message": container_status.state.waiting.message or ""
-                        }
-                    }
-                elif container_status.state.terminated:
-                    status_info["state"] = {
-                        "terminated": {
-                            "reason": container_status.state.terminated.reason,
-                            "exitCode": container_status.state.terminated.exitCode,
-                            "message": container_status.state.terminated.message or ""
-                        }
-                    }
-                elif container_status.state.running:
-                    status_info["state"] = {"running": True}
-            
-            pod_status["containerStatuses"].append(status_info)
-    
-    # Construir el prompt para HolmesGPT
-    context = f"""
-Pod con problemas detectado en el cluster:
-- Namespace: {namespace}
-- Pod: {pod_name}
-- Fase: {pod.status.phase}
-
-Estado del Pod:
-{json.dumps(pod_status, indent=2)}
-
-Eventos del Pod:
-{events_text}
-
-Logs del Pod (últimas líneas):
-{pod_logs[-2000:] if len(pod_logs) > 2000 else pod_logs}
-"""
+    # Recolectar contexto
+    contexto = _obtener_contexto_pod(event, pod)
     
     # Llamar a HolmesGPT
-    holmesgpt_url = "http://holmesgpt-holmes.holmesgpt.svc.cluster.local:80"
-    
     try:
-        # Preparar payload para HolmesGPT API
         payload = {
             "source": "robusta",
-            "title": f"Pod Issue: {pod_name}",
-            "description": f"Analiza el siguiente problema de pod en Kubernetes y proporciona una causa raíz y solución recomendada.",
+            "title": f"{problema}: {namespace}/{pod_name}",
+            "description": f"Analiza este problema de Kubernetes y proporciona causa raíz y solución. IMPORTANTE: Responde en español de forma concisa (máximo 300 palabras).",
             "subject": {
                 "name": pod_name,
                 "namespace": namespace,
                 "kind": "Pod"
             },
-            "context": {
-                "pod_status": pod_status,
-                "events": events_text,
-                "logs": pod_logs[-2000:] if len(pod_logs) > 2000 else pod_logs
-            }
+            "context": contexto
         }
         
-        logger.info(f"Enviando solicitud a HolmesGPT: {holmesgpt_url}")
-        
         response = requests.post(
-            f"{holmesgpt_url}/api/investigate",
+            f"{HOLMESGPT_URL}/api/investigate",
             json=payload,
             timeout=60,
             headers={"Content-Type": "application/json"}
         )
         
         response.raise_for_status()
-        holmes_analysis = response.json()
+        resultado = response.json()
+        analisis = resultado.get("analysis", str(resultado))
         
-        # Extraer el análisis
-        if isinstance(holmes_analysis, dict):
-            analysis_text = holmes_analysis.get("answer") or holmes_analysis.get("analysis") or str(holmes_analysis)
-        else:
-            analysis_text = str(holmes_analysis)
-        
-        logger.info(f"Análisis recibido de HolmesGPT")
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error al comunicarse con HolmesGPT: {e}")
-        analysis_text = f"❌ Error al comunicarse con HolmesGPT: {str(e)}\n\nContexto recolectado:\n{context[:1000]}..."
     except Exception as e:
-        logger.error(f"Error inesperado: {e}")
-        analysis_text = f"❌ Error inesperado: {str(e)}"
+        logger.error(f"Error comunicándose con HolmesGPT: {e}")
+        analisis = f"❌ No se pudo obtener análisis de HolmesGPT: {str(e)}"
     
-    # Crear Finding con el análisis de HolmesGPT
+    # Crear Finding conciso
     finding = Finding(
-        title=f"🔍 Análisis HolmesGPT: {namespace}/{pod_name}",
+        title=f"🤖 {problema}: {namespace}/{pod_name}",
         aggregation_key=f"HolmesGPT_{namespace}_{pod_name}",
         severity=FindingSeverity.HIGH,
         source=event.get_source(),
         finding_type=FindingType.ISSUE,
     )
     
-    # Construir bloques de enriquecimiento
-    enrichment_blocks = []
-    
-    # Agregar resumen del problema
-    enrichment_blocks.append(
-        MarkdownBlock(
-            f"**Pod problemático:** `{namespace}/{pod_name}`\n"
-            f"**Fase:** {pod.status.phase}\n"
-            f"**Cluster:** {event.get_context().cluster_name or 'N/A'}"
-        )
-    )
-    
-    # Agregar análisis de HolmesGPT
-    enrichment_blocks.append(
-        MarkdownBlock(
-            f"## 🤖 Análisis de HolmesGPT\n\n{analysis_text}"
-        )
-    )
-    
-    # Agregar eventos recientes como tabla
-    if pod_events and len(pod_events) > 0:
-        events_data = [
-            [e.type, e.reason, e.message[:100]]
-            for e in pod_events[:5]  # Últimos 5 eventos
-        ]
-        enrichment_blocks.append(
-            TableBlock(
-                rows=events_data,
-                headers=["Tipo", "Razón", "Mensaje"],
-                table_name="Eventos Recientes del Pod"
-            )
-        )
-    
-    # Agregar logs como archivo adjunto (opcional)
-    if pod_logs and len(pod_logs) > 100:
-        enrichment_blocks.append(
-            FileBlock(
-                filename=f"{pod_name}_logs.txt",
-                contents=pod_logs.encode()
-            )
-        )
-    
-    # Agregar todos los bloques al finding
-    finding.add_enrichment(enrichment_blocks)
+    # Agregar solo el análisis de HolmesGPT
+    finding.add_enrichment([
+        MarkdownBlock(f"### 🔍 Diagnóstico HolmesGPT\n\n{analisis}")
+    ])
     
     event.add_finding(finding)
 
 
-@action
-def analyze_image_pull_backoff_with_holmes(event: PodEvent):
-    """
-    Acción específica para ImagePullBackOff que envía a HolmesGPT
-    """
-    pod: Pod = event.get_pod()
-    if not pod:
-        return
-    
-    logger.info(f"ImagePullBackOff detectado en {pod.metadata.namespace}/{pod.metadata.name}")
-    
-    # Obtener información específica de ImagePullBackOff
-    container_statuses = []
-    if pod.status.containerStatuses:
-        for cs in pod.status.containerStatuses:
-            if cs.state and cs.state.waiting:
-                if "ImagePullBackOff" in cs.state.waiting.reason or "ErrImagePull" in cs.state.waiting.reason:
-                    container_statuses.append({
-                        "name": cs.name,
-                        "image": cs.image,
-                        "reason": cs.state.waiting.reason,
-                        "message": cs.state.waiting.message or ""
-                    })
-    
-    # Construir contexto específico para ImagePullBackOff
-    context = f"""
-Problema de ImagePullBackOff detectado:
-- Namespace: {pod.metadata.namespace}
-- Pod: {pod.metadata.name}
-- Contenedores afectados:
-{json.dumps(container_statuses, indent=2)}
-
-Por favor analiza por qué la imagen no se puede descargar y proporciona soluciones posibles.
-Considera:
-1. Si la imagen existe en el registro
-2. Si las credenciales son correctas
-3. Si el nombre de la imagen está bien escrito
-4. Si hay problemas de red o permisos
-"""
-    
-    holmesgpt_url = "http://holmesgpt-holmes.holmesgpt.svc.cluster.local:80"
-    
-    try:
-        payload = {
-            "source": "robusta",
-            "title": f"ImagePullBackOff: {pod.metadata.name}",
-            "description": "Analiza este problema de ImagePullBackOff y proporciona la causa raíz y solución.",
-            "subject": {
-                "name": pod.metadata.name,
-                "namespace": pod.metadata.namespace,
-                "kind": "Pod"
-            },
-            "context": {
-                "container_statuses": container_statuses,
-                "analysis_points": [
-                    "Si la imagen existe en el registro",
-                    "Si las credenciales son correctas",
-                    "Si el nombre de la imagen está bien escrito",
-                    "Si hay problemas de red o permisos"
-                ]
-            }
-        }
-        
-        response = requests.post(
-            f"{holmesgpt_url}/api/investigate",
-            json=payload,
-            timeout=60,
-            headers={"Content-Type": "application/json"}
-        )
-        
-        response.raise_for_status()
-        holmes_analysis = response.json()
-        
-        if isinstance(holmes_analysis, dict):
-            analysis_text = holmes_analysis.get("answer") or holmes_analysis.get("analysis") or str(holmes_analysis)
-        else:
-            analysis_text = str(holmes_analysis)
-        
-    except Exception as e:
-        logger.error(f"Error al comunicarse con HolmesGPT: {e}")
-        analysis_text = f"❌ Error al comunicarse con HolmesGPT: {str(e)}\n\nContexto:\n{context}"
-    
-    # Crear Finding
-    finding = Finding(
-        title=f"🔍 ImagePullBackOff - HolmesGPT: {pod.metadata.namespace}/{pod.metadata.name}",
-        aggregation_key=f"HolmesGPT_ImagePull_{pod.metadata.namespace}_{pod.metadata.name}",
-        severity=FindingSeverity.HIGH,
-        source=event.get_source(),
-        finding_type=FindingType.ISSUE,
-    )
-    
-    # Construir bloques de enriquecimiento
-    enrichment_blocks = []
-    
-    # Información del problema
-    enrichment_blocks.append(
-        MarkdownBlock(
-            f"**🚨 Problema:** ImagePullBackOff\n"
-            f"**📦 Pod:** `{pod.metadata.namespace}/{pod.metadata.name}`\n"
-            f"**🖼️ Imágenes afectadas:**\n" +
-            "\n".join([f"- `{cs['image']}` (contenedor: {cs['name']})" for cs in container_statuses])
-        )
-    )
-    
-    # Análisis de HolmesGPT
-    enrichment_blocks.append(
-        MarkdownBlock(
-            f"## 🤖 Diagnóstico de HolmesGPT\n\n{analysis_text}"
-        )
-    )
-    
-    # Tabla con detalles de contenedores
-    if container_statuses:
-        container_data = [
-            [cs['name'], cs['image'], cs['reason'], cs['message'][:50]]
-            for cs in container_statuses
-        ]
-        enrichment_blocks.append(
-            TableBlock(
-                rows=container_data,
-                headers=["Contenedor", "Imagen", "Razón", "Mensaje"],
-                table_name="Detalles de Contenedores"
-            )
-        )
-    
-    # Agregar todos los bloques al finding
-    finding.add_enrichment(enrichment_blocks)
-    
-    event.add_finding(finding)
+# Alias para compatibilidad con configuración existente
+analyze_with_holmesgpt = analizar_pod_con_holmesgpt
+analyze_image_pull_backoff_with_holmes = analizar_pod_con_holmesgpt
