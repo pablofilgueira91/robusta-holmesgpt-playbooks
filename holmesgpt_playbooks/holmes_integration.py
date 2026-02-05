@@ -1,13 +1,12 @@
 """
 Playbook Robusta para integración con HolmesGPT
-Envía problemas de pods a HolmesGPT para análisis de causa raíz con IA
+Analiza cualquier problema de Kubernetes (pods, nodes, deployments, etc.) usando IA
 """
 import logging
 import requests
-from hikaru.model.rel_1_26 import Pod
 from robusta.api import (
     action,
-    PodEvent,
+    ExecutionBaseEvent,
     Finding,
     FindingType,
     FindingSeverity,
@@ -19,99 +18,147 @@ logger = logging.getLogger(__name__)
 HOLMESGPT_URL = "http://holmesgpt-holmes.holmesgpt.svc.cluster.local:80"
 
 
-def _obtener_contexto_pod(event: PodEvent, pod: Pod) -> dict:
-    """Recolecta contexto del pod para HolmesGPT"""
-    # Eventos del pod
-    try:
-        pod_events = event.list_pod_events()
-        eventos = [{"tipo": e.type, "razon": e.reason, "mensaje": e.message} for e in pod_events[:5]]
-    except:
-        eventos = []
-    
-    # Logs del pod (últimas 1000 caracteres)
-    try:
-        logs = event.get_pod_logs()
-        logs = logs[-1000:] if len(logs) > 1000 else logs
-    except:
-        logs = ""
-    
-    # Estado de contenedores
-    contenedores = []
-    if pod.status.containerStatuses:
-        for cs in pod.status.containerStatuses:
-            info = {
-                "nombre": cs.name,
-                "imagen": cs.image,
-                "ready": cs.ready,
-                "reintentos": cs.restartCount
-            }
-            
-            if cs.state:
-                if cs.state.waiting:
-                    info["estado"] = {
-                        "esperando": {
-                            "razon": cs.state.waiting.reason,
-                            "mensaje": cs.state.waiting.message or ""
-                        }
-                    }
-                elif cs.state.terminated:
-                    info["estado"] = {
-                        "terminado": {
-                            "razon": cs.state.terminated.reason,
-                            "codigo_salida": cs.state.terminated.exitCode,
-                            "mensaje": cs.state.terminated.message or ""
-                        }
-                    }
-            
-            contenedores.append(info)
-    
-    return {
-        "eventos": eventos,
-        "logs": logs,
-        "contenedores": contenedores,
-        "fase": pod.status.phase
+def _obtener_contexto_recurso(event: ExecutionBaseEvent) -> dict:
+    """Recolecta contexto del recurso de Kubernetes para HolmesGPT"""
+    contexto = {
+        "tipo_evento": event.__class__.__name__,
+        "cluster": getattr(event.get_context(), 'cluster_name', 'unknown') if hasattr(event, 'get_context') else 'unknown'
     }
+    
+    # Intentar obtener información específica del recurso
+    try:
+        # Para recursos con método get_resource (pods, deployments, etc.)
+        if hasattr(event, 'get_resource'):
+            resource = event.get_resource()
+            if resource:
+                contexto["recurso"] = {
+                    "kind": resource.kind if hasattr(resource, 'kind') else 'Unknown',
+                    "nombre": resource.metadata.name if hasattr(resource, 'metadata') else 'unknown',
+                    "namespace": getattr(resource.metadata, 'namespace', 'cluster-scoped') if hasattr(resource, 'metadata') else None,
+                }
+                
+                # Estado del recurso si está disponible
+                if hasattr(resource, 'status'):
+                    contexto["estado"] = str(resource.status)[:500]  # Limitar tamaño
+        
+        # Para PodEvents específicamente
+        if hasattr(event, 'get_pod'):
+            pod = event.get_pod()
+            if pod:
+                # Eventos del pod
+                if hasattr(event, 'list_pod_events'):
+                    try:
+                        pod_events = event.list_pod_events()
+                        contexto["eventos"] = [
+                            {"tipo": e.type, "razon": e.reason, "mensaje": e.message} 
+                            for e in pod_events[:5]
+                        ]
+                    except:
+                        pass
+                
+                # Logs del pod
+                if hasattr(event, 'get_pod_logs'):
+                    try:
+                        logs = event.get_pod_logs()
+                        contexto["logs"] = logs[-1000:] if len(logs) > 1000 else logs
+                    except:
+                        pass
+                
+                # Estado de contenedores
+                if pod.status and pod.status.containerStatuses:
+                    contenedores = []
+                    for cs in pod.status.containerStatuses:
+                        info = {
+                            "nombre": cs.name,
+                            "imagen": cs.image,
+                            "ready": cs.ready,
+                            "reintentos": cs.restartCount
+                        }
+                        
+                        if cs.state:
+                            if cs.state.waiting:
+                                info["estado"] = {
+                                    "esperando": {
+                                        "razon": cs.state.waiting.reason,
+                                        "mensaje": cs.state.waiting.message or ""
+                                    }
+                                }
+                            elif cs.state.terminated:
+                                info["estado"] = {
+                                    "terminado": {
+                                        "razon": cs.state.terminated.reason,
+                                        "codigo_salida": cs.state.terminated.exitCode,
+                                        "mensaje": cs.state.terminated.message or ""
+                                    }
+                                }
+                        
+                        contenedores.append(info)
+                    contexto["contenedores"] = contenedores
+        
+        # Para NodeEvents
+        if hasattr(event, 'get_node'):
+            node = event.get_node()
+            if node and node.status:
+                contexto["node_conditions"] = [
+                    {"tipo": c.type, "status": c.status, "razon": c.reason or "", "mensaje": c.message or ""}
+                    for c in (node.status.conditions or [])
+                ]
+                
+    except Exception as e:
+        logger.warning(f"Error recolectando contexto: {e}")
+    
+    return contexto
 
 
 @action
-def analizar_pod_con_holmesgpt(event: PodEvent):
+def analyze_with_holmesgpt(event: ExecutionBaseEvent):
     """
-    Analiza cualquier problema de pod usando HolmesGPT AI.
+    Analiza CUALQUIER problema de Kubernetes usando HolmesGPT AI.
+    Funciona con pods, nodes, deployments, jobs, services, etc.
     Solicita diagnóstico en español con causa raíz y solución.
     """
-    pod: Pod = event.get_pod()
-    if not pod:
-        return
+    # Obtener información básica del recurso
+    resource_info = "Unknown"
+    resource_name = "unknown"
+    namespace = None
     
-    namespace = pod.metadata.namespace
-    pod_name = pod.metadata.name
+    try:
+        if hasattr(event, 'get_resource'):
+            resource = event.get_resource()
+            if resource and hasattr(resource, 'metadata'):
+                resource_name = resource.metadata.name
+                namespace = getattr(resource.metadata, 'namespace', None)
+                resource_kind = resource.kind if hasattr(resource, 'kind') else event.__class__.__name__.replace('Event', '')
+                resource_info = f"{resource_kind}/{resource_name}"
+        elif hasattr(event, 'get_pod'):
+            pod = event.get_pod()
+            if pod:
+                resource_name = pod.metadata.name
+                namespace = pod.metadata.namespace
+                resource_info = f"Pod/{resource_name}"
+        elif hasattr(event, 'get_node'):
+            node = event.get_node()
+            if node:
+                resource_name = node.metadata.name
+                resource_info = f"Node/{resource_name}"
+    except:
+        pass
     
-    # Obtener descripción del problema del estado del pod
-    problema_desc = pod.status.phase or "Error"
-    if pod.status.containerStatuses:
-        for cs in pod.status.containerStatuses:
-            if cs.state and cs.state.waiting and cs.state.waiting.reason:
-                problema_desc = cs.state.waiting.reason
-                break
-            elif cs.state and cs.state.terminated and cs.state.terminated.reason:
-                problema_desc = cs.state.terminated.reason
-                break
-    
-    logger.info(f"Analizando pod {namespace}/{pod_name} ({problema_desc}) con HolmesGPT")
+    logger.info(f"Analizando {resource_info} con HolmesGPT")
     
     # Recolectar contexto
-    contexto = _obtener_contexto_pod(event, pod)
+    contexto = _obtener_contexto_recurso(event)
     
     # Llamar a HolmesGPT
     try:
         payload = {
             "source": "robusta",
-            "title": f"{problema_desc}: {namespace}/{pod_name}",
+            "title": f"Problema en {resource_info}",
             "description": f"Analiza este problema de Kubernetes y proporciona causa raíz y solución. IMPORTANTE: Responde en español de forma concisa (máximo 300 palabras).",
             "subject": {
-                "name": pod_name,
-                "namespace": namespace,
-                "kind": "Pod"
+                "name": resource_name,
+                "namespace": namespace or "cluster-scoped",
+                "kind": resource_info.split('/')[0] if '/' in resource_info else "Resource"
             },
             "context": contexto
         }
@@ -127,14 +174,34 @@ def analizar_pod_con_holmesgpt(event: PodEvent):
         resultado = response.json()
         analisis = resultado.get("analysis", str(resultado))
         
+        # Extraer información de costos si está disponible
+        metadata = resultado.get("metadata", {})
+        usage = metadata.get("usage", {})
+        tokens_info = ""
+        
+        if usage:
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            total_tokens = usage.get("total_tokens", 0)
+            
+            # Estimación de costo (aproximado para GPT-4, ajustar según modelo)
+            # Ejemplo: GPT-4 ~$0.03/1K prompt tokens, ~$0.06/1K completion tokens
+            costo_prompt = (prompt_tokens / 1000) * 0.03
+            costo_completion = (completion_tokens / 1000) * 0.06
+            costo_total = costo_prompt + costo_completion
+            
+            tokens_info = f"\n\n---\n📊 **Uso de recursos:** {total_tokens:,} tokens (~${costo_total:.4f} USD)"
+        
+        analisis = analisis + tokens_info
+        
     except Exception as e:
         logger.error(f"Error comunicándose con HolmesGPT: {e}")
         analisis = f"❌ No se pudo obtener análisis de HolmesGPT: {str(e)}"
     
     # Crear Finding conciso
     finding = Finding(
-        title=f"🤖 {problema_desc}: {namespace}/{pod_name}",
-        aggregation_key=f"HolmesGPT_{namespace}_{pod_name}",
+        title=f"🤖 Análisis HolmesGPT: {resource_info}",
+        aggregation_key=f"HolmesGPT_{namespace}_{resource_name}" if namespace else f"HolmesGPT_{resource_name}",
         severity=FindingSeverity.HIGH,
         source=event.get_source(),
         finding_type=FindingType.ISSUE,
