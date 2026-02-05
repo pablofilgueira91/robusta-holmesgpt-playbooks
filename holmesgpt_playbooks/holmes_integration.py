@@ -155,8 +155,3 @@ def analizar_pod_con_holmesgpt(event: PodEvent):
     ])
     
     event.add_finding(finding)
-
-
-# Alias para compatibilidad con configuración existente
-analyze_with_holmesgpt = analizar_pod_con_holmesgpt
-analyze_image_pull_backoff_with_holmes = analizar_pod_con_holmesgpt
